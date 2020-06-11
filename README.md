@@ -1,13 +1,15 @@
 # Atomic Destroy
 
-This crate provides a type which can hold a value and can be atomically destroyed.
+This crate provides a type which can hold a value and can be atomically destroyed; like an atomic
+`Option`.
 
 It does not require the standard library.
 
-# Examples
+## Examples
 
 ```rust
-# use atomic_destroy::AtomicDestroy;
+use atomic_destroy::AtomicDestroy;
+
 let value = AtomicDestroy::new(Box::new(5));
 assert_eq!(**value.get().unwrap(), 5);
 value.destroy();
