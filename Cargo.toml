@@ -1,0 +1,12 @@
+[package]
+name = "atomic-destroy"
+description = "An value which can be atomically read and destroyed; like an atomic Option."
+version = "0.1.0"
+authors = ["Koxiaet <38139193+Koxiaet@users.noreply.github.com>"]
+readme = "README.md"
+repository = "https://github.com/Koxiaet/atomic-destroy"
+keywords = ["atomic", "option"]
+categories = ["data-structures", "concurrency", "no-std"]
+edition = "2018"
+
+[dependencies]
