@@ -2,7 +2,7 @@
 //! Atomically destroyable types.
 //!
 //! # Examples
-//! ```rust
+//! ```
 //! # use atomic_destroy::AtomicDestroy;
 //! let value = AtomicDestroy::new(Box::new(5));
 //! assert_eq!(**value.get().unwrap(), 5);
