@@ -76,7 +76,7 @@ impl<T> AtomicDestroy<T> {
     /// Destroy the value. If someone is currently using the value the destructor will be run when
     /// they are done.
     pub fn destroy(&self) {
-        if self.drop_state.compare_and_swap(0, 1, Ordering::SeqCst) == 0
+        if self.drop_state.compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst).is_ok()
             && self.held_count.load(Ordering::SeqCst) == 0
             && self.drop_state.swap(2, Ordering::SeqCst) == 1
         {
@@ -166,8 +166,8 @@ impl<T, R: Deref<Target = AtomicDestroy<T>>> Drop for Value<T, R> {
             && self
                 .inner
                 .drop_state
-                .compare_and_swap(1, 2, Ordering::SeqCst)
-                == 1
+                .compare_exchange(1, 2, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
         {
             // SAFETY: This can only happen when the value has not been dropped yet, as `drop_state`
             // is still 1.
