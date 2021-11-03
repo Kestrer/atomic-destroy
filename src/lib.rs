@@ -1,4 +1,4 @@
-#![cfg_attr(not(test), no_std)]
+#![no_std]
 //! Atomically destroyable types.
 //!
 //! # Examples
@@ -13,11 +13,15 @@
 #![warn(clippy::pedantic, clippy::cargo)]
 
 use core::cell::UnsafeCell;
-use core::marker::PhantomData;
 use core::mem::MaybeUninit;
 use core::ops::Deref;
-use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use core::ptr::drop_in_place;
+use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+
+#[cfg(feature = "alloc")]
+extern crate alloc;
+#[cfg(feature = "alloc")]
+use alloc::sync::Arc;
 
 /// An atomically destroyable value.
 #[derive(Debug)]
@@ -63,9 +67,29 @@ impl<T> AtomicDestroy<T> {
         }
     }
 
-    /// Get the value if it hasn't been destroyed.
-    pub fn get(&self) -> Option<Value<T, &Self>> {
-        Value::new(self)
+    /// Get a shared reference to the value if it hasn't been destroyed.
+    #[must_use]
+    pub fn get(&self) -> Option<Value<'_, T>> {
+        // Prematurely make sure that the value won't be dropped.
+        self.held_count.fetch_add(1, Ordering::SeqCst);
+
+        // Created here so that the destructor is always run.
+        let value = Value(self);
+
+        if value.0.drop_state.load(Ordering::SeqCst) > 0 {
+            // The value is dropped or is attempting to drop. Don't interfere.
+            None
+        } else {
+            Some(value)
+        }
+    }
+
+    /// Get an `Arc` reference to the value if it hasn't been destroyed.
+    #[cfg(feature = "alloc")]
+    #[must_use]
+    pub fn get_arc(self: Arc<Self>) -> Option<ArcValue<T>> {
+        core::mem::forget(self.get()?);
+        Some(ArcValue(self))
     }
 
     /// Run a function using the value.
@@ -76,7 +100,10 @@ impl<T> AtomicDestroy<T> {
     /// Destroy the value. If someone is currently using the value the destructor will be run when
     /// they are done.
     pub fn destroy(&self) {
-        if self.drop_state.compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst).is_ok()
+        if self
+            .drop_state
+            .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
             && self.held_count.load(Ordering::SeqCst) == 0
             && self.drop_state.swap(2, Ordering::SeqCst) == 1
         {
@@ -122,49 +149,25 @@ impl<T: Clone> Clone for AtomicDestroy<T> {
     }
 }
 
-/// A "locked" value of an `AtomicDestroy`. While one of these exists the value inside the
-/// `AtomicDestroy` is guaranteed not to be dropped.
+/// A "locked" shared reference to the value of an `AtomicDestroy`. While one of these exists the
+/// value inside the `AtomicDestroy` is guaranteed not to be dropped.
 #[derive(Debug)]
-pub struct Value<T, R: Deref<Target = AtomicDestroy<T>>> {
-    inner: R,
-    phantom: PhantomData<T>,
-}
+pub struct Value<'a, T>(&'a AtomicDestroy<T>);
 
-impl<T, R: Deref<Target = AtomicDestroy<T>>> Value<T, R> {
-    /// Get the value of an atomic destroyable. Equivalent to `AtomicDestroy::get`.
-    pub fn new(inner: R) -> Option<Self> {
-        // Prematurely make sure that the value won't be dropped.
-        inner.held_count.fetch_add(1, Ordering::SeqCst);
-
-        // Created here so that the destructor is always run.
-        let this = Self {
-            inner,
-            phantom: PhantomData,
-        };
-
-        if this.inner.drop_state.load(Ordering::SeqCst) > 0 {
-            // The value is dropped or is attempting to drop. Don't interfere.
-            None
-        } else {
-            Some(this)
-        }
-    }
-}
-
-impl<T, R: Deref<Target = AtomicDestroy<T>>> Deref for Value<T, R> {
+impl<T> Deref for Value<'_, T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
         // SAFETY: Held count is guaranteed to be >0 here, and so the value cannot be dropped.
-        unsafe { &*(*self.inner.value.get()).as_ptr() }
+        unsafe { &*(*self.0.value.get()).as_ptr() }
     }
 }
 
-impl<T, R: Deref<Target = AtomicDestroy<T>>> Drop for Value<T, R> {
+impl<T> Drop for Value<'_, T> {
     fn drop(&mut self) {
-        if self.inner.held_count.fetch_sub(1, Ordering::SeqCst) == 1
+        if self.0.held_count.fetch_sub(1, Ordering::SeqCst) == 1
             && self
-                .inner
+                .0
                 .drop_state
                 .compare_exchange(1, 2, Ordering::SeqCst, Ordering::SeqCst)
                 .is_ok()
@@ -174,31 +177,66 @@ impl<T, R: Deref<Target = AtomicDestroy<T>>> Drop for Value<T, R> {
             //
             // We also know that there are no other readers as `held_count` is zero.
             unsafe {
-                self.inner.drop_value();
+                self.0.drop_value();
             }
         }
     }
 }
 
+/// A "locked" `Arc` reference to the value of an `AtomicDestroy`. While one of these exists the
+/// value inside the `AtomicDestroy` is guaranteed not to be dropped.
+#[derive(Debug)]
+#[cfg(feature = "alloc")]
+pub struct ArcValue<T>(Arc<AtomicDestroy<T>>);
+
+#[cfg(feature = "alloc")]
+impl<T> Deref for ArcValue<T> {
+    type Target = T;
+    fn deref(&self) -> &Self::Target {
+        // SAFETY: See `Value::deref`
+        unsafe { &*(*self.0.value.get()).as_ptr() }
+    }
+}
+
+#[cfg(feature = "alloc")]
+impl<T> Drop for ArcValue<T> {
+    fn drop(&mut self) {
+        drop(Value(&*self.0));
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    extern crate std;
+    use std::prelude::rust_2021::*;
+    use std::sync::Arc;
+    use std::thread;
+    use std::time::{Duration, Instant};
+
     use crate::AtomicDestroy;
 
-    // Boxes are used here to better catch double frees.
+    // Boxes are used here to better catch double frees and memory leaks.
 
     #[test]
     fn test_simple() {
-        let value = AtomicDestroy::new(Box::new(5));
+        let value = Arc::new(AtomicDestroy::new(Box::new(5)));
         assert_eq!(**value.get().unwrap(), 5);
         assert_eq!(**value.get().unwrap(), 5);
+        #[cfg(feature = "alloc")]
+        assert_eq!(**value.clone().get_arc().unwrap(), 5);
         value.destroy();
         assert!(value.get().is_none());
+        #[cfg(feature = "alloc")]
+        assert!(value.get_arc().is_none());
     }
 
     #[test]
     fn test_keep_alive() {
-        let value = AtomicDestroy::new(Box::new(5));
+        let value = Arc::new(AtomicDestroy::new(Box::new(5)));
         let contents_1 = value.get().unwrap();
+        #[cfg(feature = "alloc")]
+        let contents_2 = value.clone().get_arc().unwrap();
+        #[cfg(not(feature = "alloc"))]
         let contents_2 = value.get().unwrap();
         assert_eq!(**contents_1, 5);
         assert_eq!(**contents_2, 5);
@@ -221,39 +259,40 @@ mod tests {
         assert!(<AtomicDestroy<()>>::empty().get().is_none());
     }
 
-    use std::{thread, iter};
-    use std::sync::Arc;
-    use std::time::{Instant, Duration};
-
     #[test]
     fn stress_test() {
         let limit = Instant::now() + Duration::from_secs(3);
         let value = Arc::new(AtomicDestroy::new(Box::new(5)));
 
-        let mut threads = iter::repeat_with(|| {
-            let value = value.clone();
-
-            thread::spawn(move || {
-                while Instant::now() < limit {
-                    match value.get() {
-                        Some(v) => assert_eq!(**v, 5),
-                        None => break,
+        let mut threads = (0..5)
+            .map(|_| {
+                let value = value.clone();
+                thread::spawn(move || {
+                    while Instant::now() < limit {
+                        match value.get() {
+                            Some(v) => assert_eq!(**v, 5),
+                            None => break,
+                        }
+                        #[cfg(feature = "alloc")]
+                        match value.clone().get_arc() {
+                            Some(v) => assert_eq!(**v, 5),
+                            None => break,
+                        }
                     }
-                }
+                })
             })
-        }).take(5).collect::<Vec<_>>();
+            .collect::<Vec<_>>();
 
         thread::sleep(Duration::from_secs(1));
 
-        threads.extend(iter::repeat_with(|| {
+        threads.extend((0..5).map(|_| {
             let value = value.clone();
-
             thread::spawn(move || {
                 for _ in 0..800 {
                     value.destroy();
                 }
             })
-        }).take(5));
+        }));
 
         for thread in threads {
             thread.join().unwrap();
